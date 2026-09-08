@@ -17,9 +17,9 @@
 -- CONFIG
 -- ══════════════════════════════════════════════════════════════════════════════
 local CFG = {
-    LIB_URL      = "https://raw.githubusercontent.com/xulfo/OxideUiLibary2/main/UiLibary/Libary.lua",
+    LIB_URL      = "https://raw.githubusercontent.com/xulfo/Axel HubUiLibary2/main/UiLibary/Libary.lua",
     -- Base URL for stripped game scripts (github raw).
-    SCRIPTS_BASE = "https://raw.githubusercontent.com/xulfo/OxideUiLibary2/main/scripts/",
+    SCRIPTS_BASE = "https://raw.githubusercontent.com/xulfo/Axel HubUiLibary2/main/scripts/",
     -- Fallback script when PlaceId doesn't match any known game
     FALLBACK  = "Universal.lua",
 }
@@ -174,7 +174,7 @@ end
 local function FetchApiRaw(apiPath)
     if type(request) ~= "function" then return false, nil end
     local ok, req = pcall(request, {
-        Url = "https://api.github.com/repos/xulfo/OxideUiLibary2/contents/" .. apiPath,
+        Url = "https://api.github.com/repos/xulfo/Axel HubUiLibary2/contents/" .. apiPath,
         Method = "GET",
         Headers = {
             ["Accept"]     = "application/vnd.github.raw+json",
