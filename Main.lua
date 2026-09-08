@@ -277,7 +277,7 @@ local function LoadGameScript(lib, scriptName)
     -- Use a global library binding here. Some scripts are close to Luau's
     -- 200-local register limit, so adding another local in the loader can make
     -- the stripped chunk fail before its UI is created.
-    local fullSource = "Library = _G.OxideLib;\n" .. content
+    local fullSource = "Library = _G.AxelHub;\n" .. content
 
     local chunk, compileErr = loadstring(fullSource)
     if not chunk then
@@ -303,8 +303,8 @@ print("[Loader] PlaceId:", placeId, " GameId:", gameId, "→", scriptName)
 local t0 = os.clock()
 local Library = LoadLibrary()
 
--- Expose globally (stripped scripts grab it via local Library = _G.OxideLib)
-_G.OxideLib = Library
+-- Expose globally (stripped scripts grab it via local Library = _G.AxelHub)
+_G.AxelHub = Library
 
 local scriptCached = LoadGameScript(Library, scriptName)
 print(string.format("[Loader] %s is now running (script %s, total %.2fs).",
