@@ -952,6 +952,12 @@ local stealDelay                = 1.5
 local glideSpeed                = 750
 local ignoredEggs               = {} -- [uid] = timestamp (prevents loops on failed eggs)
 
+-- Auto Treadmill handoff state: train only while there is no matching egg.
+local autoTreadmillEnabled      = false
+local treadmillTrainingActive   = false
+local treadmillHandoffBusy      = false
+local treadmillLastNoMatchAt    = 0
+
 -- Saved Return Position (automatically captured on first steal activation)
 local savedReturnCFrame         = nil
 
@@ -1436,8 +1442,12 @@ local function StealSpecificEggRobust(targetItem)
             end
 
             if wasHit or not isPlayerCarryingEgg() then
+                -- The first carry is no longer valid after a guard hit/ragdoll.
+                -- IMPORTANT: reset `carried` here so a failed second pickup can
+                -- never fall through into the return-to-base movement.
+                carried = false
                 task.wait(0.65)
-                -- Wait until not ragdolled anymore before re-pickup (user: guard hit -> stand up -> then pick up & glide)
+                -- Wait until not ragdolled anymore before re-pickup (guard hit -> stand up -> pickup again -> glide)
                 do
                     local tRag = os.clock()
                     while os.clock() - tRag < 3.2 and not HUB.dead do
@@ -1466,7 +1476,14 @@ local function StealSpecificEggRobust(targetItem)
                     local tStand = os.clock()
                     while os.clock() - tStand < 1.5 and not HUB.dead do
                         local h = findHum()
-                        if h and h:GetState() ~= Enum.HumanoidStateType.Physics and h:GetState() ~= Enum.HumanoidStateType.Ragdoll then break end
+                        if h and h:GetState() ~= Enum.HumanoidStateType.Physics and h:GetState() ~= Enum.HumanoidStateType.Ragdoll and h:GetState() ~= Enum.HumanoidStateType.FallingDown then
+                            pcall(function()
+                                h.PlatformStand = false
+                                h.AutoRotate = true
+                                h:ChangeState(Enum.HumanoidStateType.Running)
+                            end)
+                            break
+                        end
                         task.wait(0.08)
                     end
                 end
@@ -1531,6 +1548,19 @@ local function StealSpecificEggRobust(targetItem)
                 end
                 task.wait(0.08)
                 pcall(function()
+                    local h = findHum()
+                    local r = findHRP()
+                    if h then
+                        h.PlatformStand = false
+                        h.AutoRotate = true
+                        pcall(function() h:ChangeState(Enum.HumanoidStateType.Running) end)
+                    end
+                    if r then
+                        r.AssemblyLinearVelocity = Vector3.zero
+                        r.AssemblyAngularVelocity = Vector3.zero
+                    end
+                end)
+                pcall(function()
                     if carryRemote then carryRemote:InvokeServer({ Uid = record.Uid, FirstAreaSlotKey = slotKey }) end
                 end)
                 pcall(function()
@@ -1583,27 +1613,81 @@ local function StealSpecificEggRobust(targetItem)
                 end
                 if isPlayerCarryingEgg() then carried = true end
                 -- Fast trigger back to safe area once egg re-attached
+                -- Verify the second pickup before allowing any return movement.
                 if isPlayerCarryingEgg() then
+                    carried = true
                     task.wait(0.12)
                     isInstantTP = false
                 else
-                    -- Extra fallback: one more prompt scan if still not carrying
-                    task.wait(0.12)
-                    for _, d in ipairs(Workspace:GetDescendants()) do
-                        if d:IsA("ProximityPrompt") and d.Name == "CarryAreaEgg" and d.Enabled then
-                            local p = d.Parent
-                            if p and p:IsA("Attachment") then p = p.Parent end
-                            if p and (p.Position - (findHRP() and findHRP().Position or targetPos)).Magnitude < 18 then
-                                d.HoldDuration = 0
-                                pcall(function() fireproximityprompt(d) end)
+                    -- Retry the carry handshake/prompt a few times. This fixes the
+                    -- post-ragdoll case where the player is standing again but the
+                    -- first re-carry request races the egg/character replication.
+                    for retry = 1, 4 do
+                        if HUB.dead then break end
+
+                        pcall(function()
+                            if carryRemote then
+                                carryRemote:InvokeServer({ Uid = record.Uid, FirstAreaSlotKey = slotKey })
+                            end
+                        end)
+                        pcall(function()
+                            if EggState and EggState.CarryFieldEgg then
+                                EggState.CarryFieldEgg(record.Uid, slotKey)
+                            end
+                        end)
+
+                        local retryPrompt = nil
+                        local currentHRP = findHRP()
+                        local currentPos = currentHRP and currentHRP.Position or targetPos
+                        for _, d in ipairs(Workspace:GetDescendants()) do
+                            if d:IsA("ProximityPrompt") and d.Name == "CarryAreaEgg" and d.Enabled then
+                                local parent = d.Parent
+                                if parent and parent:IsA("Attachment") then parent = parent.Parent end
+                                if parent and (parent.Position - currentPos).Magnitude < 20 then
+                                    local act = (d.ActionText or ""):lower()
+                                    local obj = (d.ObjectText or ""):lower()
+                                    if not act:find("skip") and not act:find("robux") and not obj:find("skip") and not obj:find("robux") then
+                                        retryPrompt = d
+                                        break
+                                    end
+                                end
                             end
                         end
+
+                        if retryPrompt then
+                            retryPrompt.HoldDuration = 0
+                            for fire = 1, 2 do
+                                pcall(function() fireproximityprompt(retryPrompt) end)
+                                task.wait(0.06)
+                                if isPlayerCarryingEgg() then break end
+                            end
+                        end
+
+                        local tRetry = os.clock()
+                        while os.clock() - tRetry < 0.75 and not HUB.dead do
+                            if isPlayerCarryingEgg() then
+                                carried = true
+                                break
+                            end
+                            task.wait(0.05)
+                        end
+
+                        if carried and isPlayerCarryingEgg() then
+                            isInstantTP = false
+                            break
+                        end
+                        task.wait(0.12)
                     end
-                    task.wait(0.12)
-                    if isPlayerCarryingEgg() then carried = true isInstantTP = false end
                 end
             end
         end
+    end
+
+    -- Never tween back empty after a guard hit. Reacquire must be confirmed first.
+    if not carried and not isPlayerCarryingEgg() then
+        ignoredEggs[record.Uid] = os.clock()
+        pcall(restoreCollisions)
+        return false
     end
 
     -- 3. Return to base: exact bypass TP back for "Anti Guard", fast-then-slow for others! (after guard-hit we glide)
@@ -1668,7 +1752,10 @@ end
 local SendEggStolenWebhook
 
 local function StealBestEggOnce()
-    pcall(HatchAllReadyEggs)
+    -- Auto Hatch is an independent worker. Do not force-hatch from Auto Steal.
+    if autoHatchEnabled then
+        pcall(HatchAllReadyEggs)
+    end
     local eggs = GetMatchingFieldEggs(selectedStealAreas, selectedStealRarities, selectedMutationTypes)
     if #eggs == 0 then
         HUB.TriggerHopOnNoMatch()
@@ -1687,35 +1774,253 @@ local function StealBestEggOnce()
     return success
 end
 
-local function HatchAllReadyEggs()
-    if not EggState or not EggState.ReadOwnedEggs then return 0 end
-    local ok, snapshot = pcall(EggState.ReadOwnedEggs, LP.UserId)
-    if not ok or not snapshot then return 0 end
+-- ==============================================================================
+-- AUTO TREADMILL -> EGG HANDOFF
+-- ==============================================================================
+local function GetTreadmillStandPosition()
+    local treadmill = nil
+    pcall(function()
+        local plotObj = PlotState and PlotState.ResolvePlot and PlotState.ResolvePlot()
+        local folder = plotObj and plotObj.PlotFolder
+        treadmill = folder and folder:FindFirstChild("TreadmillBottom")
+    end)
+    if not treadmill or not treadmill:IsA("BasePart") then
+        return nil
+    end
+    return treadmill.Position + Vector3.new(0, 4, 0)
+end
 
-    local count = 0
-    local records = snapshot.Records or snapshot
-    if typeof(records) == "table" then
-        for uid, eggData in pairs(records) do
-            if typeof(eggData) == "table" then
-                local isReady = false
-                if EggState.IsReadyToHatch then
-                    isReady = EggState.IsReadyToHatch(eggData)
+local function IsDoubleSpeedVisible()
+    local ok, visible = pcall(function()
+        local pg = LP:FindFirstChild("PlayerGui")
+        local elements = pg and pg:FindFirstChild("Elements")
+        local left = elements and elements:FindFirstChild("Left")
+        local tools = left and left:FindFirstChild("Tools")
+        local doubleSpeed = tools and tools:FindFirstChild("DoubleYourSpeed")
+        return doubleSpeed ~= nil and doubleSpeed.Visible == true
+    end)
+    return ok and visible == true
+end
+
+local function DismountTreadmill()
+    pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+        task.wait(0.05)
+        input:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+    end)
+    local h = findHum()
+    if h then
+        h.Jump = true
+        pcall(function() h:ChangeState(Enum.HumanoidStateType.Jumping) end)
+    end
+end
+
+local function StopTreadmillTraining()
+    treadmillTrainingActive = false
+
+    -- Unequip first, then force a jump so the character is no longer treated as mounted.
+    pcall(function()
+        local rf = GetNetRemote("RF/Treadmill/AskDoff")
+        if rf then rf:InvokeServer() end
+    end)
+
+    for _ = 1, 3 do
+        DismountTreadmill()
+        task.wait(0.08)
+        if not IsDoubleSpeedVisible() then
+            break
+        end
+    end
+
+    -- Give the character one final state reset before travelling to an egg.
+    local h = findHum()
+    if h then
+        h.Jump = false
+        pcall(function() h:ChangeState(Enum.HumanoidStateType.Running) end)
+    end
+end
+
+local function RunAutoTreadmillTraining()
+    -- This function may be called by HandleAutoTreadmillHandoff while
+    -- treadmillHandoffBusy is already true. Do not reject that internal call.
+    if not autoTreadmillEnabled or isPlayerCarryingEgg() then
+        return false
+    end
+
+    -- Never mount the treadmill while a matching target is currently available.
+    local matching = GetMatchingFieldEggs(selectedStealAreas, selectedStealRarities, selectedMutationTypes)
+    if type(matching) == "table" and #matching > 0 then
+        return false
+    end
+
+    local pos = GetTreadmillStandPosition()
+    local root = findHRP()
+    if not pos or not root then
+        return false
+    end
+
+    if (root.Position - pos).Magnitude > 12 then
+        if not TravelToDestination(pos, math.min(glideSpeed, 300), true) then
+            return false
+        end
+        task.wait(0.08)
+    end
+
+    -- Re-check after travelling: an egg may have spawned while we were moving.
+    matching = GetMatchingFieldEggs(selectedStealAreas, selectedStealRarities, selectedMutationTypes)
+    if type(matching) == "table" and #matching > 0 then
+        return false
+    end
+
+    local ok = pcall(function()
+        local rf = GetNetRemote("RF/Treadmill/AskWearStill")
+        if rf then rf:InvokeServer() end
+    end)
+    if not ok then
+        treadmillTrainingActive = false
+        return false
+    end
+    treadmillTrainingActive = true
+    return true
+end
+
+local function GetMatchingEggCount()
+    local ok, eggs = pcall(GetMatchingFieldEggs, selectedStealAreas, selectedStealRarities, selectedMutationTypes)
+    if not ok or type(eggs) ~= "table" then
+        return 0
+    end
+    return #eggs
+end
+
+local function HandleAutoTreadmillHandoff()
+    if not autoTreadmillEnabled or treadmillHandoffBusy or HUB.dead then
+        return false
+    end
+
+    treadmillHandoffBusy = true
+    local ok, result = pcall(function()
+        if isPlayerCarryingEgg() then
+            return false
+        end
+
+        -- State 1: matching egg exists -> treadmill OFF -> grab/return -> rescan.
+        local matches = GetMatchingFieldEggs(selectedStealAreas, selectedStealRarities, selectedMutationTypes)
+        local matchCount = type(matches) == "table" and #matches or 0
+
+        if matchCount > 0 then
+            if treadmillTrainingActive or IsDoubleSpeedVisible() then
+                StopTreadmillTraining()
+                task.wait(0.12)
+            end
+
+            -- Extra dismount is intentional: some clients keep the mount state for a frame
+            -- after AskDoff returns, which can make the first travel command fail.
+            DismountTreadmill()
+            task.wait(0.08)
+
+            local stolen = StealBestEggOnce()
+            treadmillLastNoMatchAt = 0
+            return stolen == true
+        end
+
+        -- State 2: nothing matches -> treadmill ON.
+        treadmillLastNoMatchAt = os.clock()
+        if not treadmillTrainingActive and not IsDoubleSpeedVisible() then
+            return RunAutoTreadmillTraining()
+        end
+
+        return true
+    end)
+    treadmillHandoffBusy = false
+    return ok and result or false
+end
+
+local function HatchAllReadyEggs()
+    -- Adapted from the Ready-Egg flow, but uses this hub's existing UI state
+    -- (`autoHatchEnabled`) instead of the other UI's H.isOn()/flag system.
+    if not autoHatchEnabled or HUB.dead then
+        return 0
+    end
+
+    local save = nil
+    pcall(function()
+        if SaveModule and type(SaveModule.Get) == "function" then
+            save = SaveModule.Get()
+        end
+    end)
+
+    local eggInventory = save and save.EggInventory
+    if type(eggInventory) ~= "table" then
+        return 0
+    end
+
+    local hatchedAny = 0
+    local attempted = {}
+
+    for uid, egg in pairs(eggInventory) do
+        if HUB.dead or not autoHatchEnabled then
+            break
+        end
+
+        -- Only placed eggs are eligible for Auto Hatch Ready.
+        if type(uid) == "string" and type(egg) == "table" and egg.Placement ~= nil then
+            local ready = false
+
+            -- Prefer the live EggState readiness check from the reference flow.
+            if EggState and type(EggState.IsReadyToHatch) == "function" then
+                pcall(function()
+                    ready = EggState.IsReadyToHatch(uid) == true
+                end)
+            end
+
+            -- Fallback for clients that expose readiness directly on the saved egg.
+            if not ready then
+                if egg.Ready == true or egg.IsReady == true or egg.ReadyToHatch == true then
+                    ready = true
                 else
-                    isReady = eggData.Placement ~= nil
+                    local finishAt = tonumber(
+                        egg.HatchEndTime or egg.HatchAt or egg.ReadyAt or egg.FinishAt
+                    )
+                    if finishAt and finishAt <= os.time() then
+                        ready = true
+                    end
+                end
+            end
+
+            if ready and not attempted[uid] then
+                attempted[uid] = true
+
+                local started = false
+                if EggState and type(EggState.BeginHatch) == "function" then
+                    pcall(function()
+                        started = EggState.BeginHatch(uid) == true
+                    end)
                 end
 
-                if isReady then
-                    pcall(function()
-                        if EggState.BeginHatch then EggState.BeginHatch(uid) end
-                        task.wait(0.05)
-                        if EggState.FinishHatch then EggState.FinishHatch(uid) end
-                        count = count + 1
-                    end)
+                -- Some builds return nil from BeginHatch even though the request
+                -- was accepted. Give the state a moment, then finish the hatch.
+                if started or (EggState and type(EggState.FinishHatch) == "function") then
+                    task.wait(0.05)
+
+                    local completed = false
+                    if EggState and type(EggState.FinishHatch) == "function" then
+                        pcall(function()
+                            local result = EggState.FinishHatch(uid)
+                            completed = result ~= false
+                        end)
+                    end
+
+                    if started or completed then
+                        hatchedAny += 1
+                        task.wait(0.35)
+                    end
                 end
             end
         end
     end
-    return count
+
+    return hatchedAny
 end
 
 -- ==============================================================================
@@ -2050,10 +2355,15 @@ end)
 -- 1. Auto Steal Eggs Loop
 task.spawn(function()
     while not HUB.dead do
-        if autoStealEnabled then
+        -- Both toggles can stay ON at the same time. Auto Treadmill acts as
+        -- the fallback state, while Auto Steal remains the egg-selection/steal
+        -- feature. Matching eggs always take priority over treadmill training.
+        if autoTreadmillEnabled then
+            pcall(HandleAutoTreadmillHandoff)
+        elseif autoStealEnabled then
             pcall(StealBestEggOnce)
         end
-        task.wait(stealDelay)
+        task.wait(autoTreadmillEnabled and 0.25 or stealDelay)
     end
 end)
 
@@ -2680,22 +2990,61 @@ do
         createTextRow("🛡️ Safe & Undetected Hop")
         createTextRow("✨ Powered by Axel Hub")
 
+        local jobRow = Instance.new("Frame")
+        jobRow.Size = UDim2.new(1, 0, 0, 36)
+        jobRow.Position = UDim2.new(0, 0, 0, 127)
+        jobRow.BackgroundTransparency = 1
+        jobRow.Parent = content
+
+        local jobInput = Instance.new("TextBox")
+        jobInput.Size = UDim2.new(0.68, 0, 1, 0)
+        jobInput.Position = UDim2.new(0, 0, 0, 0)
+        jobInput.BackgroundColor3 = Theme.Panel
+        jobInput.BorderSizePixel = 0
+        jobInput.Font = Enum.Font.GothamMedium
+        jobInput.PlaceholderText = "Enter Job ID ..."
+        jobInput.Text = ""
+        jobInput.TextColor3 = Theme.TextMain
+        jobInput.PlaceholderColor3 = Theme.TextSub
+        jobInput.TextSize = 12
+        jobInput.ClearTextOnFocus = false
+        jobInput.Parent = jobRow
+        Instance.new("UICorner", jobInput).CornerRadius = UDim.new(0, 10)
+        local jobInputStroke = Instance.new("UIStroke")
+        jobInputStroke.Color = Theme.AccentMuted
+        jobInputStroke.Parent = jobInput
+
+        local joinJobButton = Instance.new("TextButton")
+        joinJobButton.Size = UDim2.new(0.30, 0, 1, 0)
+        joinJobButton.Position = UDim2.new(0.70, 0, 0, 0)
+        joinJobButton.BackgroundColor3 = Theme.Panel
+        joinJobButton.BorderSizePixel = 0
+        joinJobButton.Font = Enum.Font.GothamBold
+        joinJobButton.Text = "Join Job ID"
+        joinJobButton.TextColor3 = Theme.AccentLightYellow
+        joinJobButton.TextSize = 12
+        joinJobButton.Parent = jobRow
+        Instance.new("UICorner", joinJobButton).CornerRadius = UDim.new(0, 10)
+        local joinJobStroke = Instance.new("UIStroke")
+        joinJobStroke.Color = Theme.AccentLightYellow
+        joinJobStroke.Parent = joinJobButton
+
         local buttons = Instance.new("Frame")
         buttons.Size = UDim2.new(1, 0, 0, 36)
-        buttons.Position = UDim2.new(0, 0, 0, 127)
+        buttons.Position = UDim2.new(0, 0, 0, 173)
         buttons.BackgroundTransparency = 1
         buttons.Parent = content
 
-        local function makeButton(text, x)
+        local function makeButton(text, x, width)
             local button = Instance.new("TextButton")
-            button.Size = UDim2.new(0.31, 0, 1, 0)
+            button.Size = UDim2.new(width or 0.23, 0, 1, 0)
             button.Position = UDim2.new(x, 0, 0, 0)
             button.BackgroundColor3 = Theme.Panel
             button.BorderSizePixel = 0
             button.Font = Enum.Font.GothamBold
             button.Text = text
             button.TextColor3 = Theme.TextMain
-            button.TextSize = 12
+            button.TextSize = 11
             button.Parent = buttons
             Instance.new("UICorner", button).CornerRadius = UDim.new(0, 10)
             local stroke = Instance.new("UIStroke")
@@ -2704,15 +3053,16 @@ do
             return button, stroke
         end
 
-        local resetButton = makeButton("Refresh", 0)
-        local rejoinButton = makeButton("Rejoin", 0.345)
-        local autoButton, autoStroke = makeButton("Auto: OFF", 0.69)
+        local resetButton = makeButton("Refresh", 0, 0.23)
+        local rejoinButton = makeButton("Rejoin", 0.255, 0.23)
+        local fewestButton = makeButton("Fewest", 0.51, 0.23)
+        local autoButton, autoStroke = makeButton("Auto: OFF", 0.765, 0.235)
         autoButton.TextColor3 = Theme.RedCancel
         autoStroke.Color = Theme.RedCancel
 
         local listContainer = Instance.new("Frame")
-        listContainer.Size = UDim2.new(1, 0, 1, -173)
-        listContainer.Position = UDim2.new(0, 0, 0, 173)
+        listContainer.Size = UDim2.new(1, 0, 1, -221)
+        listContainer.Position = UDim2.new(0, 0, 0, 221)
         listContainer.BackgroundColor3 = Theme.Panel
         listContainer.BorderSizePixel = 0
         listContainer.Parent = content
@@ -2797,6 +3147,30 @@ do
             end
         end
 
+        local function joinFewestServer()
+            if #servers == 0 then
+                getHopServers()
+            end
+            local target = nil
+            for _, server in ipairs(servers) do
+                if type(server) == "table" and server.id then
+                    if not target or (tonumber(server.playing) or math.huge) < (tonumber(target.playing) or math.huge) then
+                        target = server
+                    end
+                end
+            end
+            if not target then
+                notifyLeft("No open server found")
+                return false
+            end
+            notifyLeft("Fewest Server · " .. tostring(target.playing) .. "/" .. tostring(target.maxPlayers))
+            local ok, err = HUB.JoinServer(game.PlaceId, target.id)
+            if not ok then
+                notifyLeft("Fewest Server failed")
+            end
+            return ok
+        end
+
         local function rebuildList()
             for _, child in ipairs(list:GetChildren()) do
                 if child:IsA("Frame") then child:Destroy() end
@@ -2847,6 +3221,29 @@ do
             list.CanvasSize = UDim2.new(0, 0, 0, math.max(0, #servers * 48))
         end
 
+        joinJobButton.MouseButton1Click:Connect(function()
+            local jobId = tostring(jobInput.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if jobId == "" then
+                notifyLeft("Enter a Job ID first")
+                return
+            end
+            notifyLeft("Joining Job ID...")
+            task.spawn(function()
+                local ok, err = HUB.JoinServer(game.PlaceId, jobId)
+                if not ok then
+                    notifyLeft("Join failed: " .. tostring(err or "unknown error"))
+                end
+            end)
+        end)
+
+        fewestButton.MouseButton1Click:Connect(function()
+            notifyLeft("Scanning Fewest Server...")
+            task.spawn(function()
+                getHopServers()
+                joinFewestServer()
+            end)
+        end)
+
         resetButton.MouseButton1Click:Connect(function()
             notifyLeft("Scanning Safe Servers...")
             task.spawn(function()
@@ -2890,8 +3287,8 @@ do
                 toggle.Text = "-"
                 islandCorner.CornerRadius = UDim.new(0, 16)
                 services.TweenService:Create(island, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-                    Size = UDim2.new(0, 360, 0, 460),
-                    Position = UDim2.new(0.5, -180, 0, 16)
+                    Size = UDim2.new(0, 400, 0, 520),
+                    Position = UDim2.new(0.5, -200, 0, 16)
                 }):Play()
                 task.wait(0.05)
                 content.Visible = true
@@ -3047,7 +3444,22 @@ StealSub:AddToggle({
     Name = "Auto Steal Eggs", Default = false, Flag = "steal_auto",
     Callback = safeCallback(function(v)
         autoStealEnabled = v
-        if v then EnsureSavedReturnPosition() end
+        if v then
+            EnsureSavedReturnPosition()
+            -- Do not disable Auto Treadmill. When both are ON, the treadmill
+            -- controller will steal matching eggs and resume training when none exist.
+            if autoTreadmillEnabled and not isPlayerCarryingEgg() then
+                task.spawn(function()
+                    task.wait(0.05)
+                    HandleAutoTreadmillHandoff()
+                end)
+            end
+        elseif autoTreadmillEnabled and not isPlayerCarryingEgg() then
+            task.spawn(function()
+                task.wait(0.05)
+                HandleAutoTreadmillHandoff()
+            end)
+        end
         Notify("Auto Steal", v and "Enabled" or "Disabled", v and "Success" or "Error")
     end)
 })
@@ -3116,8 +3528,8 @@ HatchSub:AddSlider({
 HatchSub:AddButton({
     Name = "Hatch All Ready Eggs Now", Primary = true,
     Callback = safeCallback(function()
-        local count = HatchAllReadyEggs()
-        Notify("Hatch", "Hatched " .. count .. " egg(s)", "Success")
+        local count = HatchAllReadyEggs() or 0
+        Notify("Hatch", "Hatched " .. tostring(count) .. " egg(s)", count > 0 and "Success" or "Info")
     end)
 })
 HatchSub:AddButton({
@@ -3171,6 +3583,26 @@ UpgradesSub:AddToggle({
 UpgradesSub:AddToggle({
     Name = "Auto Upgrade Treadmill Tier", Default = false, Flag = "up_tread_auto",
     Callback = function(v) autoUpgradeTreadmill = v end
+})
+UpgradesSub:AddToggle({
+    Name = "Auto Treadmill", Default = false, Flag = "auto_treadmill",
+    Callback = safeCallback(function(v)
+        autoTreadmillEnabled = v == true
+        if not autoTreadmillEnabled then
+            StopTreadmillTraining()
+        else
+            if autoStealEnabled then
+                EnsureSavedReturnPosition()
+            end
+            if not isPlayerCarryingEgg() then
+                task.spawn(function()
+                    task.wait(0.15)
+                    HandleAutoTreadmillHandoff()
+                end)
+            end
+        end
+        Notify("Auto Treadmill", autoTreadmillEnabled and "Enabled" or "Disabled", autoTreadmillEnabled and "Success" or "Info")
+    end)
 })
 UpgradesSub:AddToggle({
     Name = "Auto Buy Speed Trails", Default = false, Flag = "auto_buy_trails",
@@ -3449,44 +3881,50 @@ PlotTpSub:AddButton({
     end)
 })
 
--- SubTab: Player Travel
-local selectedPlayerName = nil
-local function GetPlayerList()
-    local names = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LP then table.insert(names, p.Name) end
-    end
-    table.sort(names)
-    if #names == 0 then names = { "(no other players)" } end
-    return names
-end
-
-local playerDropdown = PlayerTpSub:AddDropdown({
-    Name = "Select Player", Options = GetPlayerList(), Items = GetPlayerList(), Default = nil, Flag = "tele_plr",
-    Callback = function(v) selectedPlayerName = v end
-})
-
-PlayerTpSub:AddButton({
-    Name = "Refresh Player List",
-    Callback = function()
-        playerDropdown:SetOptions(GetPlayerList())
-        Notify("Players", "Refreshed player list", "Info")
-    end
-})
-PlayerTpSub:AddButton({
-    Name = "Travel to Player", Primary = true,
-    Callback = safeCallback(function()
-        if not selectedPlayerName then return end
-        local targetPlr = Players:FindFirstChild(selectedPlayerName)
-        local tHrp = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
-        if tHrp then
-            TravelRoadPath(tHrp.Position + Vector3.new(0, 2, 0), glideSpeed or 200)
-            Notify("Player", "Arrived at " .. selectedPlayerName, "Success")
-        else
-            Notify("Player", "Player unavailable", "Error")
+do
+    local _setupPlayerTravel = function()
+    -- SubTab: Player Travel
+    local selectedPlayerName = nil
+    local function GetPlayerList()
+        local names = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP then table.insert(names, p.Name) end
         end
-    end)
-})
+        table.sort(names)
+        if #names == 0 then names = { "(no other players)" } end
+        return names
+    end
+
+    local playerDropdown = PlayerTpSub:AddDropdown({
+        Name = "Select Player", Options = GetPlayerList(), Items = GetPlayerList(), Default = nil, Flag = "tele_plr",
+        Callback = function(v) selectedPlayerName = v end
+    })
+
+    PlayerTpSub:AddButton({
+        Name = "Refresh Player List",
+        Callback = function()
+            playerDropdown:SetOptions(GetPlayerList())
+            Notify("Players", "Refreshed player list", "Info")
+        end
+    })
+    PlayerTpSub:AddButton({
+        Name = "Travel to Player", Primary = true,
+        Callback = safeCallback(function()
+            if not selectedPlayerName then return end
+            local targetPlr = Players:FindFirstChild(selectedPlayerName)
+            local tHrp = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
+            if tHrp then
+                TravelRoadPath(tHrp.Position + Vector3.new(0, 2, 0), glideSpeed or 200)
+                Notify("Player", "Arrived at " .. selectedPlayerName, "Success")
+            else
+                Notify("Player", "Player unavailable", "Error")
+            end
+        end)
+    })
+
+    end
+    _setupPlayerTravel()
+end
 
 -- SubTab: Visuals & Performance
 PerfSub:AddToggle({
@@ -3506,335 +3944,433 @@ end
 -- =============================================================================
 -- ==============================================================================
 -- AXEL HUB WEBHOOK TAB
--- Adapted from the supplied webhook pattern; only the webhook transport/embed
--- behavior is reused. The UI and steal integration remain native to src 1.
+-- Scoped separately to avoid Luau's 200-local-register limit.
 -- ==============================================================================
-local axelWebhookUrl = ""
-local axelWebhookEnabled = false
-local webhookNotifyAnimal = true
-local webhookNotifyRarity = true
-local webhookNotifyEgg = true
-local webhookNotifyCount = true
-local webhookStealCount = 0
+(function()
+    local axelWebhookUrl = ""
+    local axelWebhookEnabled = false
+    local webhookNotifyAnimal = true
+    local webhookNotifyRarity = true
+    local webhookNotifyEgg = true
+    local webhookNotifyCount = true
+    local webhookStealCount = 0
 
-local function GetAxelWebhookRequest()
-    return (syn and syn.request)
-        or (http and http.request)
-        or http_request
-        or request
-end
-
-local function PostAxelWebhook(payload, force)
-    if type(payload) ~= "table" then
-        return false, "invalid payload"
+    local function GetAxelWebhookRequest()
+        return (syn and syn.request)
+            or (http and http.request)
+            or http_request
+            or request
     end
 
-    if not force and not axelWebhookEnabled then
-        return false, "webhook disabled"
+    local function PostAxelWebhook(payload, force)
+        if type(payload) ~= "table" then
+            return false, "invalid payload"
+        end
+
+        if not force and not axelWebhookEnabled then
+            return false, "webhook disabled"
+        end
+
+        local url = tostring(axelWebhookUrl or "")
+        if url == "" or not url:match("^https://discord%.com/api/webhooks/")
+           and not url:match("^https://discordapp%.com/api/webhooks/") then
+            return false, "invalid webhook URL"
+        end
+
+        local req = GetAxelWebhookRequest()
+        if type(req) ~= "function" then
+            return false, "HTTP request function unavailable"
+        end
+
+        local okEncode, body = pcall(function()
+            return game:GetService("HttpService"):JSONEncode(payload)
+        end)
+        if not okEncode then
+            return false, "JSON encode failed"
+        end
+
+        local okRequest, response = pcall(function()
+            return req({
+                Url = url,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body,
+            })
+        end)
+
+        if not okRequest then
+            return false, tostring(response)
+        end
+
+        local status = type(response) == "table" and tonumber(response.StatusCode)
+        if status and status >= 400 then
+            return false, "HTTP " .. tostring(status)
+        end
+
+        return true, response
     end
 
-    local url = tostring(axelWebhookUrl or "")
-    if url == "" or not url:match("^https://discord%.com/api/webhooks/")
-       and not url:match("^https://discordapp%.com/api/webhooks/") then
-        return false, "invalid webhook URL"
+    -- Axel Hub logo from the URL supplied by the user.
+    local AXEL_WEBHOOK_LOGO =
+        "https://media.discordapp.net/attachments/1474749204973883508/1474749350461706361/axel_hub_2.png?ex=6aa2a6dc&is=6aa1555c&hm=a231cf00e3ecedb25eced50aec0042af2e1373be8298348665fa689d63acbbe2&=&format=webp&quality=lossless"
+
+    -- Bottom banner/background.
+    -- IMPORTANT: Discord needs a DIRECT image URL here (GIF/PNG/JPG/WEBP).
+    -- A Canva share page such as canva.link/... is not an image URL and will not render.
+    -- Put your animated GIF/WebP CDN URL here after uploading it somewhere public.
+    local AXEL_WEBHOOK_BANNER = "https://www.image2url.com/r2/default/gifs/1788963639200-c2fed6c8-1d70-4d0a-9c80-6a6daec994aa.gif"
+
+    -- Emoji used in the embed. Unicode emoji render reliably in Discord webhooks.
+    -- The discord.com/assets/...svg links are not embeddable image markdown inside
+    -- normal embed text, so use Unicode or Discord custom emoji syntax instead.
+    local AXEL_EMOJI = {
+        Egg      = "🥚",
+        Animal   = "🐾",
+        Rarity   = "💎",
+        Score    = "🌟",
+        Mutation = "🧬",
+        Area     = "📍",
+        Count    = "📦",
+        Discord  = "🔗",
+        Check    = "✅",
+    }
+
+    -- Discord embed color is driven by rarity.
+    local RARITY_WEBHOOK_COLORS = {
+        Titan        = 0xFF2D55,
+        Divine       = 0xFF1493,
+        Transcendent = 0xFF1493,
+        Superior     = 0xFF1493,
+        Eternal      = 0x8B5CF6,
+        Limited      = 0xF43F5E,
+        Secret       = 0x7C3AED,
+        Exotic       = 0xA855F7,
+        Cosmic       = 0x06B6D4,
+        Exclusive    = 0x14B8A6,
+        Admin        = 0xEF4444,
+        Mythic       = 0xEC4899,
+        Mythical     = 0xEC4899,
+        Prismatic    = 0xF59E0B,
+        Rainbow      = 0xF59E0B,
+        ["Squishy God"] = 0xF59E0B,
+        BrainrotGod  = 0xF59E0B,
+        Legendary    = 0xFBBF24,
+        Epic         = 0xA855F7,
+        Rare         = 0x3B82F6,
+        SuperRare    = 0x60A5FA,
+        Celestial    = 0x22D3EE,
+        Uncommon     = 0x22C55E,
+        Basic        = 0x94A3B8,
+        Common       = 0x9CA3AF,
+        Unknown      = 0x6B7280,
+    }
+
+    local function GetWebhookRarityColor(rarity)
+        local name = tostring(rarity or "Unknown")
+        local key = RARITY_WEBHOOK_COLORS[name] and name
+        if key then
+            return RARITY_WEBHOOK_COLORS[key]
+        end
+
+        local lower = string.lower(name)
+        for rarityName, color in pairs(RARITY_WEBHOOK_COLORS) do
+            if string.lower(rarityName) == lower then
+                return color
+            end
+        end
+
+        return RARITY_WEBHOOK_COLORS.Unknown
     end
 
-    local req = GetAxelWebhookRequest()
-    if type(req) ~= "function" then
-        return false, "HTTP request function unavailable"
-    end
-
-    local okEncode, body = pcall(function()
-        return game:GetService("HttpService"):JSONEncode(payload)
-    end)
-    if not okEncode then
-        return false, "JSON encode failed"
-    end
-
-    local okRequest, response = pcall(function()
-        return req({
-            Url = url,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = body,
-        })
-    end)
-
-    if not okRequest then
-        return false, tostring(response)
-    end
-
-    local status = type(response) == "table" and tonumber(response.StatusCode)
-    if status and status >= 400 then
-        return false, "HTTP " .. tostring(status)
-    end
-
-    return true, response
-end
-
-local AXEL_WEBHOOK_ART = "https://www.roblox.com/asset/?id=86949082023913"
-
-local function BuildWebhookEmbed(title, description, fields)
-    return {
-        username = "Axel Hub",
-        embeds = {{
+    local function BuildWebhookEmbed(title, description, fields, color)
+        local embed = {
             author = {
                 name = "AXEL HUB",
+                icon_url = AXEL_WEBHOOK_LOGO,
             },
             title = tostring(title),
             description = tostring(description),
-            color = 16766720,
+            color = tonumber(color) or 0xFFC107,
             fields = fields or {},
             footer = {
                 text = "Axel Hub  •  Steal an Egg",
+                icon_url = AXEL_WEBHOOK_LOGO,
+            },
+            thumbnail = {
+                url = AXEL_WEBHOOK_LOGO,
             },
             timestamp = DateTime.now():ToIsoDate(),
-        }},
-    }
-end
+        }
 
-local function GetAssetDisplayName(category)
-    if type(category) ~= "string" or category == "" then
-        return "Unknown"
+        -- Discord renders embed.image BELOW the fields, which matches the
+        -- bottom-banner look in your reference. Animated GIF/WebP can animate
+        -- there when the URL points directly to the media file.
+        if type(AXEL_WEBHOOK_BANNER) == "string"
+            and AXEL_WEBHOOK_BANNER ~= ""
+            and (
+                AXEL_WEBHOOK_BANNER:match("%.gif([?#]|$)")
+                or AXEL_WEBHOOK_BANNER:match("%.webp([?#]|$)")
+                or AXEL_WEBHOOK_BANNER:match("%.png([?#]|$)")
+                or AXEL_WEBHOOK_BANNER:match("%.jpe?g([?#]|$)")
+                or AXEL_WEBHOOK_BANNER:match("^https?://")
+            ) then
+            embed.image = {
+                url = AXEL_WEBHOOK_BANNER,
+            }
+        end
+
+        return {
+            username = "Axel Hub",
+            avatar_url = AXEL_WEBHOOK_LOGO,
+            embeds = { embed },
+        }
     end
-    if AssetsData then
-        local dir = AssetsData.Directory or AssetsData
-        local info = type(dir) == "table" and dir[category]
-        if type(info) == "table" then
-            local name = info.DisplayName or info.Name or info.PetName or info.AssetName
-            if type(name) == "string" and name ~= "" then
-                return name
+
+    local function GetAssetDisplayName(category)
+        if type(category) ~= "string" or category == "" then
+            return "Unknown"
+        end
+        if AssetsData then
+            local dir = AssetsData.Directory or AssetsData
+            local info = type(dir) == "table" and dir[category]
+            if type(info) == "table" then
+                local name = info.DisplayName or info.Name or info.PetName or info.AssetName
+                if type(name) == "string" and name ~= "" then
+                    return name
+                end
             end
         end
-    end
-    return category
-end
-
-local function GetTargetAnimalName(record)
-    if type(record) ~= "table" then
-        return "Unknown"
+        return category
     end
 
-    local direct = record.AnimalName or record.PetName or record.Animal
-        or record.ContainedAnimal or record.ResultName
-    if type(direct) == "string" and direct ~= "" then
-        return direct
+    local function GetTargetAnimalName(record)
+        if type(record) ~= "table" then
+            return "Unknown"
+        end
+
+        local direct = record.AnimalName or record.PetName or record.Animal
+            or record.ContainedAnimal or record.ResultName
+        if type(direct) == "string" and direct ~= "" then
+            return direct
+        end
+
+        return GetAssetDisplayName(record.AssetCategory or record.Category or record.Name)
     end
 
-    return GetAssetDisplayName(record.AssetCategory or record.Category or record.Name)
-end
+    local function GetTargetRarity(record)
+        if type(record) ~= "table" then
+            return "Unknown", 0
+        end
 
-local function GetTargetRarity(record)
-    if type(record) ~= "table" then
-        return "Unknown", 0
+        local ok, rarity, score = pcall(function()
+            return GetEggRarityInfo(record)
+        end)
+
+        if ok then
+            return tostring(rarity or "Common"), tonumber(score) or 100
+        end
+
+        return "Common", 100
     end
 
-    local ok, rarity, score = pcall(function()
-        return GetEggRarityInfo(record)
-    end)
+    local function GetTargetMutationText(record)
+        if type(record) ~= "table" then
+            return "Normal"
+        end
 
-    if ok then
-        return tostring(rarity or "Common"), tonumber(score) or 100
-    end
+        local mutations = record.Mutations
+        if type(mutations) == "table" then
+            local out = {}
+            for _, mutation in ipairs(mutations) do
+                if type(mutation) == "string" and mutation ~= "" then
+                    table.insert(out, mutation)
+                end
+            end
+            if #out > 0 then
+                return table.concat(out, ", ")
+            end
+        end
 
-    return "Common", 100
-end
+        local mutation = record.Mutation or record.BaseMutation
+        if type(mutation) == "string" and mutation ~= "" then
+            return mutation
+        end
 
-local function GetTargetMutationText(record)
-    if type(record) ~= "table" then
         return "Normal"
     end
 
-    local mutations = record.Mutations
-    if type(mutations) == "table" then
-        local out = {}
-        for _, mutation in ipairs(mutations) do
-            if type(mutation) == "string" and mutation ~= "" then
-                table.insert(out, mutation)
-            end
+    local function SendAxelReady(force)
+        return PostAxelWebhook(BuildWebhookEmbed(
+            "[" .. AXEL_EMOJI.Check .. "] Webhook Connected",
+            "",
+            {
+                { name = "Game", value = "Steal an Egg", inline = true },
+                { name = "Player", value = tostring(LP.DisplayName or LP.Name), inline = true },
+                { name = "Job ID", value = tostring(game.JobId), inline = false },
+            },
+            0xFFC107
+        ), force)
+    end
+
+    -- This assigns the predeclared outer reference so the steal system can call it.
+    SendEggStolenWebhook = function(targetItem)
+        local record = targetItem and (targetItem.record or targetItem)
+        if type(record) ~= "table" then
+            return false, "missing egg record"
         end
-        if #out > 0 then
-            return table.concat(out, ", ")
+
+        if not webhookNotifyAnimal and not webhookNotifyRarity
+           and not webhookNotifyEgg and not webhookNotifyCount then
+            return false, "all notifications disabled"
         end
-    end
 
-    local mutation = record.Mutation or record.BaseMutation
-    if type(mutation) == "string" and mutation ~= "" then
-        return mutation
-    end
+        webhookStealCount += 1
 
-    return "Normal"
-end
+        local rarity, score = GetTargetRarity(record)
+        local animalName = GetTargetAnimalName(record)
+        local mutationText = GetTargetMutationText(record)
+        local eggName = GetAssetDisplayName(record.AssetCategory or record.EggName or record.Name)
 
-local function SendAxelReady(force)
-    return PostAxelWebhook(BuildWebhookEmbed(
-        "✅ Webhook Connected",
-        "Axel Hub webhook connection is working.",
-        {
-            { name = "Game", value = "Steal an Egg", inline = true },
-            { name = "Player", value = tostring(LP.DisplayName or LP.Name), inline = true },
-            { name = "Job ID", value = tostring(game.JobId), inline = false },
-        }
-    ), force)
-end
+        local fields = {}
 
-SendEggStolenWebhook = function(targetItem)
-    local record = targetItem and (targetItem.record or targetItem)
-    if type(record) ~= "table" then
-        return false, "missing egg record"
-    end
+        if webhookNotifyAnimal then
+            table.insert(fields, {
+                name = "[" .. AXEL_EMOJI.Animal .. "] Animal",
+                value = tostring(animalName),
+                inline = true,
+            })
+        end
 
-    if not webhookNotifyAnimal and not webhookNotifyRarity
-       and not webhookNotifyEgg and not webhookNotifyCount then
-        return false, "all notifications disabled"
-    end
+        if webhookNotifyEgg then
+            table.insert(fields, {
+                name = "[" .. AXEL_EMOJI.Egg .. "] Egg",
+                value = tostring(eggName),
+                inline = true,
+            })
+        end
 
-    webhookStealCount += 1
+        if webhookNotifyRarity then
+            table.insert(fields, {
+                name = "[" .. AXEL_EMOJI.Rarity .. "] Rarity",
+                value = tostring(rarity),
+                inline = true,
+            })
+            table.insert(fields, {
+                name = "[" .. AXEL_EMOJI.Score .. "] Score",
+                value = tostring(math.floor(score)),
+                inline = true,
+            })
+        end
 
-    local rarity, score = GetTargetRarity(record)
-    local animalName = GetTargetAnimalName(record)
-    local mutationText = GetTargetMutationText(record)
-    local eggName = GetAssetDisplayName(record.AssetCategory or record.EggName or record.Name)
-
-    local fields = {}
-
-    if webhookNotifyAnimal then
         table.insert(fields, {
-            name = "🐾 Animal",
-            value = tostring(animalName),
+            name = "[" .. AXEL_EMOJI.Mutation .. "] Mutation",
+            value = mutationText,
             inline = true,
         })
-    end
 
-    if webhookNotifyEgg then
         table.insert(fields, {
-            name = "🥚 Egg",
-            value = tostring(eggName),
+            name = "[" .. AXEL_EMOJI.Area .. "] Area",
+            value = tostring(record.AreaId or "Unknown"),
             inline = true,
         })
+
+        if webhookNotifyCount then
+            table.insert(fields, {
+                name = "[" .. AXEL_EMOJI.Count .. "] Stolen Count",
+                value = tostring(webhookStealCount),
+                inline = true,
+            })
+        end
+
+        table.insert(fields, {
+            name = "[" .. AXEL_EMOJI.Discord .. "] Discord",
+            value = "discord.gg/axelhub",
+            inline = false,
+        })
+
+        return PostAxelWebhook(BuildWebhookEmbed(
+            "AXEL HUB",
+            "",
+            fields,
+            GetWebhookRarityColor(rarity)
+        ))
     end
 
-    if webhookNotifyRarity then
-        table.insert(fields, {
-            name = "💎 Rarity",
-            value = tostring(rarity),
-            inline = true,
-        })
-        table.insert(fields, {
-            name = "⭐ Score",
-            value = tostring(math.floor(score)),
-            inline = true,
-        })
-    end
-
-    table.insert(fields, {
-        name = "🧬 Mutation",
-        value = mutationText,
-        inline = true,
+    local WebhookTab = Window:AddTab({
+        Name = "Webhook",
+        Subtitle = "Discord notifications",
+        Icon = "!",
     })
 
-    table.insert(fields, {
-        name = "📍 Area",
-        value = tostring(record.AreaId or "Unknown"),
-        inline = true,
+    local WebhookMain = WebhookTab:AddSubTab("Webhook")
+    local WebhookEvents = WebhookTab:AddSubTab("Notifications")
+
+    WebhookMain:AddParagraph({
+        Title = "Discord Webhook",
+        Content = "Send a Discord notification when an egg is successfully collected.",
     })
 
-    if webhookNotifyCount then
-        table.insert(fields, {
-            name = "📦 Stolen Count",
-            value = tostring(webhookStealCount),
-            inline = true,
-        })
-    end
-
-    table.insert(fields, {
-        name = "🔗 Discord",
-        value = "discord.gg/axelhub",
-        inline = false,
+    WebhookMain:AddInput({
+        Name = "Webhook URL",
+        Default = "",
+        Flag = "axel_webhook_url",
+        Callback = function(v)
+            axelWebhookUrl = tostring(v or "")
+        end,
     })
 
-    return PostAxelWebhook(BuildWebhookEmbed(
-        "✅ Egg Collected",
-        "A new egg has been collected successfully.",
-        fields
-    ))
-end
+    WebhookMain:AddToggle({
+        Name = "Enable Webhook",
+        Default = false,
+        Flag = "axel_webhook_enabled",
+        Callback = function(v)
+            axelWebhookEnabled = v == true
+            Notify("Webhook", axelWebhookEnabled and "Enabled" or "Disabled",
+                axelWebhookEnabled and "Success" or "Info")
+        end,
+    })
 
-local WebhookTab = Window:AddTab({
-    Name = "Webhook",
-    Subtitle = "Discord notifications",
-    Icon = "!",
-})
+    WebhookMain:AddButton({
+        Name = "Test Send Now",
+        Primary = true,
+        Callback = safeCallback(function()
+            local ok, err = SendAxelReady(true)
+            Notify("Webhook",
+                ok and "Test sent successfully" or ("Send failed: " .. tostring(err)),
+                ok and "Success" or "Error")
+        end),
+    })
 
+    WebhookMain:AddDivider()
 
-local WebhookMain = WebhookTab:AddSubTab("Webhook")
-local WebhookEvents = WebhookTab:AddSubTab("Notifications")
+    WebhookEvents:AddToggle({
+        Name = "Animal",
+        Default = true,
+        Flag = "webhook_animal",
+        Callback = function(v) webhookNotifyAnimal = v == true end,
+    })
 
-WebhookMain:AddParagraph({
-    Title = "Discord Webhook",
-    Content = "Send a Discord notification when an egg is successfully collected.",
-})
+    WebhookEvents:AddToggle({
+        Name = "Rarity",
+        Default = true,
+        Flag = "webhook_rarity",
+        Callback = function(v) webhookNotifyRarity = v == true end,
+    })
 
-WebhookMain:AddInput({
-    Name = "Webhook URL",
-    Default = "",
-    Flag = "axel_webhook_url",
-    Callback = function(v)
-        axelWebhookUrl = tostring(v or "")
-    end,
-})
+    WebhookEvents:AddToggle({
+        Name = "Egg",
+        Default = true,
+        Flag = "webhook_egg",
+        Callback = function(v) webhookNotifyEgg = v == true end,
+    })
 
-WebhookMain:AddToggle({
-    Name = "Enable Webhook",
-    Default = false,
-    Flag = "axel_webhook_enabled",
-    Callback = function(v)
-        axelWebhookEnabled = v == true
-        Notify("Webhook", axelWebhookEnabled and "Enabled" or "Disabled",
-            axelWebhookEnabled and "Success" or "Info")
-    end,
-})
-
-WebhookMain:AddButton({
-    Name = "Test Send Now",
-    Primary = true,
-    Callback = safeCallback(function()
-        local ok, err = SendAxelReady(true)
-        Notify("Webhook",
-            ok and "Test sent successfully" or ("Send failed: " .. tostring(err)),
-            ok and "Success" or "Error")
-    end),
-})
-
-WebhookMain:AddDivider()
-
-WebhookEvents:AddToggle({
-    Name = "Animal",
-    Default = true,
-    Flag = "webhook_animal",
-    Callback = function(v) webhookNotifyAnimal = v == true end,
-})
-
-WebhookEvents:AddToggle({
-    Name = "Rarity",
-    Default = true,
-    Flag = "webhook_rarity",
-    Callback = function(v) webhookNotifyRarity = v == true end,
-})
-
-WebhookEvents:AddToggle({
-    Name = "Egg",
-    Default = true,
-    Flag = "webhook_egg",
-    Callback = function(v) webhookNotifyEgg = v == true end,
-})
-
-WebhookEvents:AddToggle({
-    Name = "Stolen Count",
-    Default = true,
-    Flag = "webhook_count",
-    Callback = function(v) webhookNotifyCount = v == true end,
-})
+    WebhookEvents:AddToggle({
+        Name = "Stolen Count",
+        Default = true,
+        Flag = "webhook_count",
+        Callback = function(v) webhookNotifyCount = v == true end,
+    })
+end)()
 
 -- -----------------------------------------------------------------------------
 -- TAB 5: SETTINGS & CONFIG
